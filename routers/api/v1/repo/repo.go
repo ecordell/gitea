@@ -12,6 +12,9 @@ import (
 	"strings"
 	"time"
 
+	v1 "github.com/authzed/authzed-go/proto/authzed/api/v1"
+
+	authzed_client "code.gitea.io/gitea/authzed"
 	actions_model "code.gitea.io/gitea/models/actions"
 	activities_model "code.gitea.io/gitea/models/activities"
 	"code.gitea.io/gitea/models/db"
@@ -237,6 +240,190 @@ func Search(ctx *context.APIContext) {
 	})
 }
 
+// FastSearch repositories via options - filters with SpiceDB + Materialize
+func FastSearch(ctx *context.APIContext) {
+	// swagger:operation GET /repos/fastsearch repository repoSearch
+	// ---
+	// summary: Search for repositories (with SpiceDB and Materialize)
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: q
+	//   in: query
+	//   description: keyword
+	//   type: string
+	// - name: topic
+	//   in: query
+	//   description: Limit search to repositories with keyword as topic
+	//   type: boolean
+	// - name: includeDesc
+	//   in: query
+	//   description: include search of keyword within repository description
+	//   type: boolean
+	// - name: uid
+	//   in: query
+	//   description: search only for repos that the user with the given id owns or contributes to
+	//   type: integer
+	//   format: int64
+	// - name: priority_owner_id
+	//   in: query
+	//   description: repo owner to prioritize in the results
+	//   type: integer
+	//   format: int64
+	// - name: team_id
+	//   in: query
+	//   description: search only for repos that belong to the given team id
+	//   type: integer
+	//   format: int64
+	// - name: starredBy
+	//   in: query
+	//   description: search only for repos that the user with the given id has starred
+	//   type: integer
+	//   format: int64
+	// - name: private
+	//   in: query
+	//   description: include private repositories this user has access to (defaults to true)
+	//   type: boolean
+	// - name: is_private
+	//   in: query
+	//   description: show only pubic, private or all repositories (defaults to all)
+	//   type: boolean
+	// - name: template
+	//   in: query
+	//   description: include template repositories this user has access to (defaults to true)
+	//   type: boolean
+	// - name: archived
+	//   in: query
+	//   description: show only archived, non-archived or all repositories (defaults to all)
+	//   type: boolean
+	// - name: mode
+	//   in: query
+	//   description: type of repository to search for. Supported values are
+	//                "fork", "source", "mirror" and "collaborative"
+	//   type: string
+	// - name: exclusive
+	//   in: query
+	//   description: if `uid` is given, search only for repos that the user owns
+	//   type: boolean
+	// - name: sort
+	//   in: query
+	//   description: sort repos by attribute. Supported values are
+	//                "alpha", "created", "updated", "size", "git_size", "lfs_size", "stars", "forks" and "id".
+	//                Default is "alpha"
+	//   type: string
+	// - name: order
+	//   in: query
+	//   description: sort order, either "asc" (ascending) or "desc" (descending).
+	//                Default is "asc", ignored if "sort" is not specified.
+	//   type: string
+	// - name: page
+	//   in: query
+	//   description: page number of results to return (1-based)
+	//   type: integer
+	// - name: limit
+	//   in: query
+	//   description: page size of results
+	//   type: integer
+	// responses:
+	//   "200":
+	//     "$ref": "#/responses/SearchResults"
+	//   "422":
+	//     "$ref": "#/responses/validationError"
+
+	private := ctx.IsSigned && (ctx.FormString("private") == "" || ctx.FormBool("private"))
+	if ctx.PublicOnly {
+		private = false
+	}
+
+	opts := &repo_model.SearchRepoOptions{
+		ListOptions:        utils.GetListOptions(ctx),
+		Actor:              ctx.Doer,
+		Keyword:            ctx.FormTrim("q"),
+		OwnerID:            ctx.FormInt64("uid"),
+		PriorityOwnerID:    ctx.FormInt64("priority_owner_id"),
+		TeamID:             ctx.FormInt64("team_id"),
+		TopicOnly:          ctx.FormBool("topic"),
+		Collaborate:        optional.None[bool](),
+		Private:            private,
+		Template:           optional.None[bool](),
+		StarredByID:        ctx.FormInt64("starredBy"),
+		IncludeDescription: ctx.FormBool("includeDesc"),
+	}
+
+	if ctx.FormString("template") != "" {
+		opts.Template = optional.Some(ctx.FormBool("template"))
+	}
+
+	if ctx.FormBool("exclusive") {
+		opts.Collaborate = optional.Some(false)
+	}
+
+	mode := ctx.FormString("mode")
+	switch mode {
+	case "source":
+		opts.Fork = optional.Some(false)
+		opts.Mirror = optional.Some(false)
+	case "fork":
+		opts.Fork = optional.Some(true)
+	case "mirror":
+		opts.Mirror = optional.Some(true)
+	case "collaborative":
+		opts.Mirror = optional.Some(false)
+		opts.Collaborate = optional.Some(true)
+	case "":
+	default:
+		ctx.Error(http.StatusUnprocessableEntity, "", fmt.Errorf("Invalid search mode: \"%s\"", mode))
+		return
+	}
+
+	if ctx.FormString("archived") != "" {
+		opts.Archived = optional.Some(ctx.FormBool("archived"))
+	}
+
+	if ctx.FormString("is_private") != "" {
+		opts.IsPrivate = optional.Some(ctx.FormBool("is_private"))
+	}
+
+	sortMode := ctx.FormString("sort")
+	if len(sortMode) > 0 {
+		sortOrder := ctx.FormString("order")
+		if len(sortOrder) == 0 {
+			sortOrder = "asc"
+		}
+		if searchModeMap, ok := repo_model.OrderByMap[sortOrder]; ok {
+			if orderBy, ok := searchModeMap[sortMode]; ok {
+				opts.OrderBy = orderBy
+			} else {
+				ctx.Error(http.StatusUnprocessableEntity, "", fmt.Errorf("Invalid sort mode: \"%s\"", sortMode))
+				return
+			}
+		} else {
+			ctx.Error(http.StatusUnprocessableEntity, "", fmt.Errorf("Invalid sort order: \"%s\"", sortOrder))
+			return
+		}
+	}
+
+	repos, count, err := repo_model.FastSearchRepository(ctx, opts)
+	if err != nil {
+		ctx.JSON(http.StatusInternalServerError, api.SearchError{
+			OK:    false,
+			Error: err.Error(),
+		})
+		return
+	}
+
+	results := make([]*api.Repository, len(repos))
+	for i, repo := range repos {
+		results[i] = convert.ToRepo(ctx, repo, access_model.Permission{AccessMode: perm.AccessModeOwner})
+	}
+	ctx.SetLinkHeader(int(count), opts.PageSize)
+	ctx.SetTotalCountHeader(count)
+	ctx.JSON(http.StatusOK, api.SearchResults{
+		OK:   true,
+		Data: results,
+	})
+}
+
 // CreateUserRepo create a repository for a user
 func CreateUserRepo(ctx *context.APIContext, owner *user_model.User, opt api.CreateRepoOption) {
 	if opt.AutoInit && opt.Readme == "" {
@@ -280,6 +467,17 @@ func CreateUserRepo(ctx *context.APIContext, owner *user_model.User, opt api.Cre
 	repo, err = repo_model.GetRepositoryByID(ctx, repo.ID)
 	if err != nil {
 		ctx.Error(http.StatusInternalServerError, "GetRepositoryByID", err)
+	}
+
+	// write owner relation
+	_, err = authzed_client.PermissionsClient.WriteRelationships(ctx, &v1.WriteRelationshipsRequest{
+		Updates: []*v1.RelationshipUpdate{{
+			Operation:    v1.RelationshipUpdate_OPERATION_TOUCH,
+			Relationship: authzed_client.RepoOwnerRel(repo, owner),
+		}},
+	})
+	if err != nil {
+		ctx.Error(http.StatusInternalServerError, "WriteOwnerSpiceDBRel", err)
 	}
 
 	ctx.JSON(http.StatusCreated, convert.ToRepo(ctx, repo, access_model.Permission{AccessMode: perm.AccessModeOwner}))

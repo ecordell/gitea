@@ -7,6 +7,9 @@ import (
 	"context"
 	"fmt"
 
+	v1 "github.com/authzed/authzed-go/proto/authzed/api/v1"
+
+	authzed_client "code.gitea.io/gitea/authzed"
 	"code.gitea.io/gitea/models/db"
 	"code.gitea.io/gitea/models/git"
 	issues_model "code.gitea.io/gitea/models/issues"
@@ -44,6 +47,17 @@ func CreateRepository(ctx context.Context, doer, owner *user_model.User, opts Cr
 	repo, err := CreateRepositoryDirectly(ctx, doer, owner, opts)
 	if err != nil {
 		// No need to rollback here we should do this in CreateRepository...
+		return nil, err
+	}
+
+	// write owner relation
+	_, err = authzed_client.PermissionsClient.WriteRelationships(ctx, &v1.WriteRelationshipsRequest{
+		Updates: []*v1.RelationshipUpdate{{
+			Operation:    v1.RelationshipUpdate_OPERATION_TOUCH,
+			Relationship: authzed_client.RepoOwnerRel(repo, owner),
+		}},
+	})
+	if err != nil {
 		return nil, err
 	}
 

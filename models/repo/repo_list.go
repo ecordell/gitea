@@ -393,12 +393,12 @@ func SearchRepositoryCondition(opts *SearchRepoOptions) builder.Cond {
 
 	// Restrict to starred repositories
 	if opts.StarredByID > 0 {
-		cond = cond.And(builder.In("id", builder.Select("repo_id").From("star").Where(builder.Eq{"uid": opts.StarredByID})))
+		cond = cond.And(builder.In("`repository`.id", builder.Select("repo_id").From("star").Where(builder.Eq{"uid": opts.StarredByID})))
 	}
 
 	// Restrict to watched repositories
 	if opts.WatchedByID > 0 {
-		cond = cond.And(builder.In("id", builder.Select("repo_id").From("watch").Where(builder.Eq{"user_id": opts.WatchedByID})))
+		cond = cond.And(builder.In("`repository`.id", builder.Select("repo_id").From("watch").Where(builder.Eq{"user_id": opts.WatchedByID})))
 	}
 
 	// Restrict repositories to those the OwnerID owns or contributes to as per opts.Collaborate
@@ -466,18 +466,18 @@ func SearchRepositoryCondition(opts *SearchRepoOptions) builder.Cond {
 			Where(subQueryCond).
 			GroupBy("repo_topic.repo_id")
 
-		keywordCond := builder.In("id", subQuery)
+		keywordCond := builder.In("`repository`.id", subQuery)
 		if !opts.TopicOnly {
 			likes := builder.NewCond()
 			for _, v := range strings.Split(opts.Keyword, ",") {
-				likes = likes.Or(builder.Like{"lower_name", strings.ToLower(v)})
+				likes = likes.Or(builder.Like{"`repository`.lower_name", strings.ToLower(v)})
 
 				// If the string looks like "org/repo", match against that pattern too
 				if opts.TeamID == 0 && strings.Count(opts.Keyword, "/") == 1 {
 					pieces := strings.Split(opts.Keyword, "/")
 					ownerName := pieces[0]
 					repoName := pieces[1]
-					likes = likes.Or(builder.And(builder.Like{"owner_name", strings.ToLower(ownerName)}, builder.Like{"lower_name", strings.ToLower(repoName)}))
+					likes = likes.Or(builder.And(builder.Like{"owner_name", strings.ToLower(ownerName)}, builder.Like{"`repository`.lower_name", strings.ToLower(repoName)}))
 				}
 
 				if opts.IncludeDescription {
@@ -490,7 +490,7 @@ func SearchRepositoryCondition(opts *SearchRepoOptions) builder.Cond {
 	}
 
 	if opts.Language != "" {
-		cond = cond.And(builder.In("id", builder.
+		cond = cond.And(builder.In("`repository`.id", builder.
 			Select("repo_id").
 			From("language_stat").
 			Where(builder.Eq{"language": opts.Language}).And(builder.Eq{"is_primary": true})))
@@ -558,7 +558,15 @@ func SearchRepositoryCondition(opts *SearchRepoOptions) builder.Cond {
 // it returns results in given range and number of total results.
 func SearchRepository(ctx context.Context, opts *SearchRepoOptions) (RepositoryList, int64, error) {
 	cond := SearchRepositoryCondition(opts)
-	return SearchRepositoryByCondition(ctx, opts, cond, true)
+	return SearchRepositoryByCondition(ctx, opts, cond, true, false)
+}
+
+// FastSearchRepository returns repositories based on search options,
+// it returns results in given range and number of total results.
+// It filters by joining m2s and s2s
+func FastSearchRepository(ctx context.Context, opts *SearchRepoOptions) (RepositoryList, int64, error) {
+	cond := SearchRepositoryCondition(opts)
+	return SearchRepositoryByCondition(ctx, opts, cond, true, true)
 }
 
 // CountRepository counts repositories based on search options,
@@ -567,8 +575,8 @@ func CountRepository(ctx context.Context, opts *SearchRepoOptions) (int64, error
 }
 
 // SearchRepositoryByCondition search repositories by condition
-func SearchRepositoryByCondition(ctx context.Context, opts *SearchRepoOptions, cond builder.Cond, loadAttributes bool) (RepositoryList, int64, error) {
-	sess, count, err := searchRepositoryByCondition(ctx, opts, cond)
+func SearchRepositoryByCondition(ctx context.Context, opts *SearchRepoOptions, cond builder.Cond, loadAttributes bool, directFilter bool) (RepositoryList, int64, error) {
+	sess, count, err := searchRepositoryByCondition(ctx, opts, cond, directFilter)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -595,7 +603,7 @@ func SearchRepositoryByCondition(ctx context.Context, opts *SearchRepoOptions, c
 	return repos, count, nil
 }
 
-func searchRepositoryByCondition(ctx context.Context, opts *SearchRepoOptions, cond builder.Cond) (db.Engine, int64, error) {
+func searchRepositoryByCondition(ctx context.Context, opts *SearchRepoOptions, cond builder.Cond, directFilter bool) (db.Engine, int64, error) {
 	if opts.Page <= 0 {
 		opts.Page = 1
 	}
@@ -617,6 +625,18 @@ func searchRepositoryByCondition(ctx context.Context, opts *SearchRepoOptions, c
 
 	sess := db.GetEngine(ctx)
 
+	if directFilter {
+		sess = sess.
+			Join("LEFT", []string{"set_to_set", "s2s"}, "s2s.parent_id = repository.id::text").
+			Join("INNER", []string{"member_to_set", "m2s"}, "(m2s.set_id = s2s.child_id AND m2s.set_type = s2s.child_type AND m2s.set_relation = s2s.child_relation) OR (repository.id::text = m2s.set_id)").
+			Join("INNER", []string{"user", "u"}, "u.id::text = m2s.member_id").
+			Where(`u.id = ? AND m2s.member_type = ? AND m2s.member_relation = ? AND (
+									  (s2s.parent_type = ? AND s2s.parent_relation=?)
+								    OR
+                    (m2s.set_type = ? AND m2s.set_relation = ?)
+                  )`, opts.Actor.ID, "user", "", "repo", "view", "repo", "view")
+	}
+
 	var count int64
 	if opts.PageSize > 0 {
 		var err error
@@ -628,7 +648,17 @@ func searchRepositoryByCondition(ctx context.Context, opts *SearchRepoOptions, c
 		}
 	}
 
-	sess = sess.Where(cond).OrderBy(opts.OrderBy.String(), args...)
+	if directFilter {
+		sess = sess.
+			Join("LEFT", []string{"set_to_set", "s2s"}, "s2s.parent_id = repository.id::text").
+			Join("INNER", []string{"member_to_set", "m2s"}, "(m2s.set_id = s2s.child_id AND m2s.set_type = s2s.child_type AND m2s.set_relation = s2s.child_relation) OR (repository.id::text = m2s.set_id)").
+			Join("INNER", []string{"user", "u"}, "u.id::text = m2s.member_id").
+			Where(`u.id = ? AND m2s.member_type = ? AND m2s.member_relation = ? AND (
+						(s2s.parent_type = ? AND s2s.parent_relation=?)
+						OR
+						(m2s.set_type = ? AND m2s.set_relation = ?)
+					)`, opts.Actor.ID, "user", "", "repo", "view", "repo", "view").And(cond).OrderBy("repository."+opts.OrderBy.String(), args...)
+	}
 	if opts.PageSize > 0 {
 		sess = sess.Limit(opts.PageSize, (opts.Page-1)*opts.PageSize)
 	}
@@ -706,7 +736,7 @@ func SearchRepositoryIDs(ctx context.Context, opts *SearchRepoOptions) ([]int64,
 
 	cond := SearchRepositoryCondition(opts)
 
-	sess, count, err := searchRepositoryByCondition(ctx, opts, cond)
+	sess, count, err := searchRepositoryByCondition(ctx, opts, cond, false)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -760,7 +790,7 @@ func GetUserRepositories(ctx context.Context, opts *SearchRepoOptions) (Reposito
 	}
 
 	if len(opts.LowerNames) > 0 {
-		cond = cond.And(builder.In("lower_name", opts.LowerNames))
+		cond = cond.And(builder.In("`repository`.lower_name", opts.LowerNames))
 	}
 
 	sess := db.GetEngine(ctx)

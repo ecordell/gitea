@@ -654,7 +654,7 @@ func SearchRepo(ctx *context.Context) {
 		return
 	}
 
-	repos, count, err := repo_model.SearchRepository(ctx, opts)
+	repos, count, err := repo_model.FastSearchRepository(ctx, opts)
 	if err != nil {
 		log.Error("SearchRepository: %v", err)
 		ctx.JSON(http.StatusInternalServerError, nil)

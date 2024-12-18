@@ -8,6 +8,9 @@ import (
 	"context"
 	"fmt"
 
+	v1 "github.com/authzed/authzed-go/proto/authzed/api/v1"
+
+	authzed_client "code.gitea.io/gitea/authzed"
 	"code.gitea.io/gitea/models/db"
 	issues_model "code.gitea.io/gitea/models/issues"
 	"code.gitea.io/gitea/models/perm"
@@ -32,7 +35,7 @@ func AddOrUpdateCollaborator(ctx context.Context, repo *repo_model.Repository, u
 		return user_model.ErrBlockedUser
 	}
 
-	return db.WithTx(ctx, func(ctx context.Context) error {
+	if err := db.WithTx(ctx, func(ctx context.Context) error {
 		collaboration, has, err := db.Get[repo_model.Collaboration](ctx, builder.Eq{
 			"repo_id": repo.ID,
 			"user_id": u.ID,
@@ -61,7 +64,18 @@ func AddOrUpdateCollaborator(ctx context.Context, repo *repo_model.Repository, u
 		}
 
 		return access_model.RecalculateUserAccess(ctx, repo, u.ID)
+	}); err != nil {
+		return err
+	}
+
+	// write collaborator relation
+	_, err := authzed_client.PermissionsClient.WriteRelationships(ctx, &v1.WriteRelationshipsRequest{
+		Updates: []*v1.RelationshipUpdate{{
+			Operation:    v1.RelationshipUpdate_OPERATION_TOUCH,
+			Relationship: authzed_client.RepoCollaboratorRel(repo, u),
+		}},
 	})
+	return err
 }
 
 // DeleteCollaboration removes collaboration relation between the user and repository.

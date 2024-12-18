@@ -8,6 +8,9 @@ import (
 	"errors"
 	"net/http"
 
+	v1 "github.com/authzed/authzed-go/proto/authzed/api/v1"
+
+	authzed_client "code.gitea.io/gitea/authzed"
 	"code.gitea.io/gitea/models/perm"
 	access_model "code.gitea.io/gitea/models/perm/access"
 	repo_model "code.gitea.io/gitea/models/repo"
@@ -190,6 +193,17 @@ func AddOrUpdateCollaborator(ctx *context.APIContext) {
 			ctx.Error(http.StatusInternalServerError, "AddOrUpdateCollaborator", err)
 		}
 		return
+	}
+
+	// write collaborator relation
+	_, err = authzed_client.PermissionsClient.WriteRelationships(ctx, &v1.WriteRelationshipsRequest{
+		Updates: []*v1.RelationshipUpdate{{
+			Operation:    v1.RelationshipUpdate_OPERATION_TOUCH,
+			Relationship: authzed_client.RepoCollaboratorRel(ctx.Repo.Repository, collaborator),
+		}},
+	})
+	if err != nil {
+		ctx.Error(http.StatusInternalServerError, "WriteCollaboratorSpiceDBRel", err)
 	}
 
 	ctx.Status(http.StatusNoContent)
